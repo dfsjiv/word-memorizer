@@ -1,0 +1,17 @@
+:root {
+  font-family: 'Noto Sans SC', 'Microsoft YaHei', sans-serif;
+  color-scheme: light;
+  --canvas: #f4f1eb; --panel: #faf8f4; --card: #fffdf9; --soft: #f7f4ef; --hover: #f0ece5;
+  --ink: #26231f; --muted: #78716a; --faint: #a8a19a; --line: #e4dfd7; --tag: #ebe6de;
+  --accent: #71865c; --accent-soft: #e8eee1; --shadow: rgba(69, 59, 48, .08);
+  font-synthesis: none; text-rendering: optimizeLegibility;
+}
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --canvas: #1b1c1a; --panel: #20211f; --card: #252623; --soft: #2a2b28; --hover: #2d2f2b;
+  --ink: #f0ede7; --muted: #aaa59d; --faint: #77736d; --line: #383a35; --tag: #343630;
+  --accent: #a4ba8e; --accent-soft: #323c2b; --shadow: rgba(0, 0, 0, .18);
+}
+html, body, #root { min-width: 320px; min-height: 100%; margin: 0; }
+body { min-height: 100vh; }
+::selection { background: var(--accent-soft); color: var(--ink); }
