@@ -1,25 +1,58 @@
 {
   "name": "word-memorizer",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "一个专注、纯粹的背单词桌面应用",
+  "author": "dfsjiv",
+  "license": "MIT",
+  "main": "electron/main.cjs",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "desktop": "npm run build && electron .",
+    "package:win": "npm run build && electron-packager . 默记 --platform=win32 --arch=x64 --out=release-packager --overwrite --prune=true --ignore=^/(src|output|release.*|\\.git) && electron-builder --win nsis --prepackaged release-packager/默记-win32-x64 --config.directories.output=release-installer"
   },
   "dependencies": {
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
+    "@electron/packager": "^20.3.0",
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "^6.1.1",
+    "electron": "^44.4.1",
+    "electron-builder": "^26.15.3",
     "oxlint": "^1.81.0",
     "typescript": "~6.0.2",
     "vite": "^8.3.0"
+  },
+  "build": {
+    "appId": "com.dfsjiv.wordmemorizer",
+    "productName": "默记",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "artifactName": "WordMemorizer-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "默记"
+    }
   }
 }

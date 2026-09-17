@@ -27,9 +27,21 @@ npm run dev
 npm run build
 ```
 
+启动桌面版：
+
+```bash
+npm run desktop
+```
+
+生成 Windows 安装程序：
+
+```bash
+npm run package:win
+```
+
 ## 技术栈
 
-React、TypeScript、Vite。后续计划添加 Tauri 桌面外壳和 SQLite 数据库。
+React、TypeScript、Vite、Electron。
 
 ## 导入格式
 
