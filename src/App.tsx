@@ -1,315 +1,414 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import './App.css'
+import type { DailyRecord, DictionaryEntry, WordRecord } from './domain'
+import { exposureCount, mergeWordLists, normalizeWord, wordId } from './domain'
+import { CACHE_OPTIONS, loadDictionaryTiers, lookupGithub, lookupGithubBatch, lookupPublicDictionary } from './dictionary'
+import type { CacheSize } from './dictionary'
+import { parseWordFile } from './importer'
+import { intervalForExposure, localDate, nextReviewDate } from './scheduler'
+import { loadWords, saveWords } from './storage'
 
-type View = 'study' | 'lookup' | 'words' | 'stats'
+type View = 'study' | 'lookup' | 'library' | 'stats'
+type DictionaryStatus = 'idle' | 'loading' | 'online' | 'cached' | 'mixed' | 'error'
+type Settings = { dailyGoal: number; cacheSize: CacheSize }
+type ArchiveData = { version: 2; updatedAt: string; words: WordRecord[]; history: DailyRecord[]; settings: Settings }
+type SearchResult = { entry: DictionaryEntry; origin: 'personal' | 'cache' | 'github' | 'online'; count: number }
 
-type Word = {
-  id: string
-  word: string
-  phonetic: string
-  meaning: string
-  example: string
-  exampleMeaning: string
-  interval: number
-  due: string
-  lookupCount: number
-  reciteCount: number
+const initialSettings: Settings = { dailyGoal: 20, cacheSize: 10000 }
+
+const isArchive = (value: unknown): value is ArchiveData => {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Partial<ArchiveData>
+  return candidate.version === 2 && Array.isArray(candidate.words) && Array.isArray(candidate.history)
 }
 
-type DailyRecord = { date: string; reviewed: number }
+const asEntry = (word: WordRecord): DictionaryEntry => ({
+  word: word.word,
+  phonetic: word.phonetic,
+  meaning: word.meaning,
+  definition: word.definition,
+  tags: word.tags,
+  rank: null,
+})
 
-const DAY = 86_400_000
-const today = () => new Date().toISOString().slice(0, 10)
-const totalCount = (word: Word) => word.lookupCount + word.reciteCount
-const reviewInterval = (count: number) => [0, 1, 1, 2, 3, 5, 8, 14, 21, 30][Math.min(count, 9)]
-
-const addDays = (days: number) => {
-  const date = new Date()
-  date.setHours(12, 0, 0, 0)
-  date.setDate(date.getDate() + days)
-  return date.toISOString().slice(0, 10)
-}
-
-const starterWords: Word[] = [
-  { id: 'serendipity', word: 'serendipity', phonetic: '/ˌserənˈdɪpəti/', meaning: 'n. 意外发现美好事物的运气', example: 'We met by pure serendipity.', exampleMeaning: '我们的相遇纯属美好的偶然。', interval: 0, due: today(), lookupCount: 0, reciteCount: 0 },
-  { id: 'resilient', word: 'resilient', phonetic: '/rɪˈzɪliənt/', meaning: 'adj. 有韧性的；能迅速恢复的', example: 'Children are often remarkably resilient.', exampleMeaning: '孩子往往有着惊人的适应力。', interval: 0, due: today(), lookupCount: 0, reciteCount: 0 },
-  { id: 'eloquent', word: 'eloquent', phonetic: '/ˈeləkwənt/', meaning: 'adj. 雄辩的；有说服力的', example: 'She gave an eloquent speech.', exampleMeaning: '她发表了一场富有说服力的演讲。', interval: 0, due: today(), lookupCount: 0, reciteCount: 0 },
-  { id: 'meticulous', word: 'meticulous', phonetic: '/məˈtɪkjələs/', meaning: 'adj. 一丝不苟的；细致的', example: 'He kept meticulous records.', exampleMeaning: '他保存了十分细致的记录。', interval: 0, due: today(), lookupCount: 0, reciteCount: 0 },
-  { id: 'ambiguous', word: 'ambiguous', phonetic: '/æmˈbɪɡjuəs/', meaning: 'adj. 模棱两可的；含糊的', example: 'The ending of the story is ambiguous.', exampleMeaning: '这个故事的结局模棱两可。', interval: 0, due: today(), lookupCount: 0, reciteCount: 0 },
-  { id: 'pragmatic', word: 'pragmatic', phonetic: '/præɡˈmætɪk/', meaning: 'adj. 务实的；讲求实效的', example: 'We need a pragmatic solution.', exampleMeaning: '我们需要一个务实的解决方案。', interval: 0, due: today(), lookupCount: 0, reciteCount: 0 },
-  { id: 'ubiquitous', word: 'ubiquitous', phonetic: '/juːˈbɪkwɪtəs/', meaning: 'adj. 无处不在的', example: 'Smartphones have become ubiquitous.', exampleMeaning: '智能手机已经无处不在。', interval: 0, due: today(), lookupCount: 0, reciteCount: 0 },
-  { id: 'concise', word: 'concise', phonetic: '/kənˈsaɪs/', meaning: 'adj. 简明的；简洁的', example: 'Keep your answer clear and concise.', exampleMeaning: '让你的回答清楚而简洁。', interval: 0, due: today(), lookupCount: 0, reciteCount: 0 },
-  { id: 'intricate', word: 'intricate', phonetic: '/ˈɪntrɪkət/', meaning: 'adj. 错综复杂的；精细的', example: 'The watch has an intricate mechanism.', exampleMeaning: '这块手表有精密复杂的机械结构。', interval: 0, due: today(), lookupCount: 0, reciteCount: 0 },
-  { id: 'tranquil', word: 'tranquil', phonetic: '/ˈtræŋkwɪl/', meaning: 'adj. 宁静的；平静的', example: 'The garden was quiet and tranquil.', exampleMeaning: '花园安静而宁谧。', interval: 0, due: today(), lookupCount: 0, reciteCount: 0 },
-]
-
-const loadWords = (): Word[] => {
-  try {
-    const saved = localStorage.getItem('mora-words')
-    if (!saved) return starterWords
-    return JSON.parse(saved).map((word: Word & { reviews?: number }) => ({
-      ...word,
-      lookupCount: word.lookupCount ?? 0,
-      reciteCount: word.reciteCount ?? word.reviews ?? 0,
-    }))
-  } catch { return starterWords }
-}
-
-const loadHistory = (): DailyRecord[] => {
-  try { return JSON.parse(localStorage.getItem('mora-history') || '[]') }
-  catch { return [] }
-}
-
-const Icon = ({ name }: { name: 'home' | 'search' | 'book' | 'chart' | 'plus' | 'upload' | 'volume' | 'sun' }) => {
+const Icon = ({ name }: { name: 'study' | 'search' | 'book' | 'chart' | 'sound' | 'upload' | 'plus' | 'folder' | 'moon' | 'back' }) => {
   const paths = {
-    home: <><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10v10h13V10M9 20v-6h6v6"/></>,
+    study: <><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V3H6.5A2.5 2.5 0 0 0 4 5.5z"/><path d="M4 5.5v14M8 7h8"/></>,
     search: <><circle cx="11" cy="11" r="7"/><path d="m16 16 5 5"/></>,
-    book: <><path d="M4 5.5A3.5 3.5 0 0 1 7.5 2H20v16H7.5A3.5 3.5 0 0 0 4 21.5z"/><path d="M4 5.5v16M8 6h8M8 10h7"/></>,
-    chart: <><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></>,
-    plus: <><path d="M12 5v14M5 12h14"/></>,
+    book: <><path d="M3 5h7a3 3 0 0 1 3 3v13a3 3 0 0 0-3-3H3z"/><path d="M21 5h-5a3 3 0 0 0-3 3v13a3 3 0 0 1 3-3h5z"/></>,
+    chart: <><path d="M4 20V11M10 20V5M16 20v-7M22 20H2"/></>,
+    sound: <><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12"/></>,
     upload: <><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></>,
-    volume: <><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12"/></>,
-    sun: <><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.65 6.35l1.42-1.42"/></>,
+    plus: <><path d="M12 5v14M5 12h14"/></>,
+    folder: <><path d="M3 6h7l2 2h9v11H3z"/></>,
+    moon: <><path d="M20 15.5A8 8 0 0 1 8.5 4 8 8 0 1 0 20 15.5z"/></>,
+    back: <><path d="m15 18-6-6 6-6"/></>,
   }
   return <svg className="icon" viewBox="0 0 24 24" aria-hidden="true">{paths[name]}</svg>
 }
 
 function App() {
-  const [words, setWords] = useState<Word[]>(loadWords)
-  const [history, setHistory] = useState<DailyRecord[]>(loadHistory)
+  const [words, setWords] = useState<WordRecord[]>([])
+  const [history, setHistory] = useState<DailyRecord[]>([])
+  const [settings, setSettings] = useState<Settings>(initialSettings)
+  const [ready, setReady] = useState(false)
+  const [startupOpen, setStartupOpen] = useState(true)
   const [view, setView] = useState<View>('study')
+  const [dictionary, setDictionary] = useState<DictionaryEntry[]>([])
+  const [dictionaryStatus, setDictionaryStatus] = useState<DictionaryStatus>('idle')
+  const [dictionaryProgress, setDictionaryProgress] = useState(0)
+  const [startupError, setStartupError] = useState('')
+  const [query, setQuery] = useState('')
+  const [remoteResults, setRemoteResults] = useState<SearchResult[]>([])
+  const [remoteSearching, setRemoteSearching] = useState(false)
+  const [selectedWordId, setSelectedWordId] = useState<string | null>(null)
   const [showAnswer, setShowAnswer] = useState(false)
-  const [queue, setQueue] = useState<string[]>(() => loadWords().filter((word) => word.due <= today()).slice(0, 10).map((word) => word.id))
-  const [search, setSearch] = useState('')
-  const [lookupQuery, setLookupQuery] = useState('')
-  const [lookedUpId, setLookedUpId] = useState<string | null>(null)
+  const [extraQueue, setExtraQueue] = useState<string[]>([])
+  const [librarySearch, setLibrarySearch] = useState('')
+  const [category, setCategory] = useState('全部')
   const [adding, setAdding] = useState(false)
+  const [notice, setNotice] = useState('')
+  const [archiveInfo, setArchiveInfo] = useState<ArchiveInfo | null>(null)
   const [dark, setDark] = useState(() => localStorage.getItem('mora-theme') === 'dark')
   const fileInput = useRef<HTMLInputElement>(null)
 
-  useEffect(() => localStorage.setItem('mora-words', JSON.stringify(words)), [words])
-  useEffect(() => localStorage.setItem('mora-history', JSON.stringify(history)), [history])
+  useEffect(() => {
+    const boot = async () => {
+      let initialWords = await loadWords()
+      let initialHistory: DailyRecord[] = []
+      let nextSettings = initialSettings
+      try {
+        initialHistory = JSON.parse(localStorage.getItem('mora-history-v2') || '[]')
+        nextSettings = { ...initialSettings, ...JSON.parse(localStorage.getItem('mora-settings') || '{}') }
+      } catch { /* Defaults are valid. */ }
+
+      if (window.moraDesktop) {
+        const loaded = await window.moraDesktop.loadArchive()
+        setArchiveInfo(loaded.info)
+        if (isArchive(loaded.data)) {
+          initialWords = loaded.data.words
+          initialHistory = loaded.data.history
+          nextSettings = { ...initialSettings, ...loaded.data.settings }
+        }
+      }
+      setWords(initialWords)
+      setHistory(initialHistory)
+      setSettings(nextSettings)
+      setReady(true)
+    }
+    boot()
+  }, [])
+
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? 'dark' : 'light'
     localStorage.setItem('mora-theme', dark ? 'dark' : 'light')
   }, [dark])
 
-  const currentWord = words.find((word) => word.id === queue[0])
-  const reviewedToday = history.find((item) => item.date === today())?.reviewed || 0
-  const dueCount = words.filter((word) => word.due <= today()).length
-  const learnedCount = words.filter((word) => totalCount(word) > 0).length
-  const masteredCount = words.filter((word) => totalCount(word) >= 8).length
-  const progress = Math.min(100, Math.round((reviewedToday / 10) * 100))
+  useEffect(() => {
+    if (!ready) return
+    const timer = window.setTimeout(async () => {
+      await saveWords(words)
+      localStorage.setItem('mora-history-v2', JSON.stringify(history))
+      localStorage.setItem('mora-settings', JSON.stringify(settings))
+      if (window.moraDesktop) {
+        const data: ArchiveData = { version: 2, updatedAt: new Date().toISOString(), words, history, settings }
+        setArchiveInfo(await window.moraDesktop.saveArchive(data))
+      }
+    }, 400)
+    return () => window.clearTimeout(timer)
+  }, [history, ready, settings, words])
 
-  const filteredWords = useMemo(() => {
-    const query = search.trim().toLowerCase()
-    return words.filter((word) => !query || word.word.toLowerCase().includes(query) || word.meaning.includes(query))
-  }, [words, search])
+  const today = localDate()
+  const reviewedToday = history.find((record) => record.date === today)?.recited || 0
+  const goalComplete = reviewedToday >= settings.dailyGoal
+  const dueWords = useMemo(() => words
+    .filter((word) => word.dueDate <= today)
+    .sort((left, right) => left.dueDate.localeCompare(right.dueDate) || exposureCount(left) - exposureCount(right)), [today, words])
+  const currentWord = words.find((word) => word.id === extraQueue[0]) || dueWords[0]
+  const selectedWord = words.find((word) => word.id === selectedWordId)
 
-  const lookupResults = useMemo(() => {
-    const query = lookupQuery.trim().toLowerCase()
-    if (!query) return []
-    return words.filter((word) => word.word.toLowerCase().includes(query) || word.meaning.includes(query)).slice(0, 8)
-  }, [words, lookupQuery])
+  const begin = async (size: CacheSize) => {
+    setStartupError('')
+    setDictionaryStatus('loading')
+    setDictionaryProgress(0)
+    try {
+      const loaded = await loadDictionaryTiers(size, setDictionaryProgress)
+      setDictionary(loaded.entries)
+      setDictionaryStatus(loaded.source)
+      setSettings((current) => ({ ...current, cacheSize: size }))
+      setStartupOpen(false)
+    } catch (error) {
+      setDictionaryStatus('error')
+      setStartupError(error instanceof Error ? error.message : '词典加载失败')
+    }
+  }
 
-  const lookedUpWord = words.find((word) => word.id === lookedUpId)
+  const localResults = useMemo<SearchResult[]>(() => {
+    const normalized = normalizeWord(query)
+    if (!normalized) return []
+    const chinese = /[\u3400-\u9fff]/.test(normalized)
+    const results: SearchResult[] = []
+    const seen = new Set<string>()
+    for (const word of words) {
+      const key = normalizeWord(word.word)
+      if ((chinese ? word.meaning.includes(query) : key.startsWith(normalized)) && !seen.has(key)) {
+        results.push({ entry: asEntry(word), origin: 'personal', count: exposureCount(word) })
+        seen.add(key)
+        if (results.length >= 8) return results
+      }
+    }
+    for (const entry of dictionary) {
+      const key = normalizeWord(entry.word)
+      if ((chinese ? entry.meaning.includes(query) : key.startsWith(normalized)) && !seen.has(key)) {
+        results.push({ entry, origin: 'cache', count: 0 })
+        seen.add(key)
+        if (results.length >= 8) break
+      }
+    }
+    return results
+  }, [dictionary, query, words])
 
-  const speak = (text: string) => {
-    speechSynthesis.cancel()
-    const utterance = new SpeechSynthesisUtterance(text)
-    utterance.lang = 'en-US'
-    utterance.rate = 0.82
-    speechSynthesis.speak(utterance)
+  const visibleResults = remoteResults.length ? remoteResults : localResults
+
+  const searchRemote = async () => {
+    if (!query.trim()) return
+    setRemoteSearching(true)
+    setRemoteResults([])
+    try {
+      const github = await lookupGithub(query)
+      if (github.length) {
+        setRemoteResults(github.map((entry) => ({ entry, origin: 'github', count: 0 })))
+      } else {
+        const online = await lookupPublicDictionary(query)
+        setRemoteResults(online.map((entry) => ({ entry, origin: 'online', count: 0 })))
+        if (!online.length) setNotice('本地、GitHub 和公共在线词典都没有找到这个词。')
+      }
+    } catch {
+      try {
+        const online = await lookupPublicDictionary(query)
+        setRemoteResults(online.map((entry) => ({ entry, origin: 'online', count: 0 })))
+      } catch { setNotice('网络查询失败，请检查网络连接。') }
+    } finally { setRemoteSearching(false) }
+  }
+
+  const openLookupResult = (result: SearchResult) => {
+    const key = normalizeWord(result.entry.word)
+    const existing = words.find((word) => normalizeWord(word.word) === key)
+    if (existing) {
+      const count = exposureCount(existing) + 1
+      setWords((items) => items.map((word) => word.id === existing.id ? {
+        ...word,
+        lookupCount: word.lookupCount + 1,
+        dueDate: nextReviewDate(count),
+        updatedAt: new Date().toISOString(),
+      } : word))
+      setSelectedWordId(existing.id)
+      return
+    }
+    const now = new Date().toISOString()
+    const created: WordRecord = {
+      id: wordId(result.entry.word),
+      word: result.entry.word,
+      phonetic: result.entry.phonetic,
+      meaning: result.entry.meaning,
+      definition: result.entry.definition,
+      example: '',
+      exampleMeaning: '',
+      lookupCount: 1,
+      reciteCount: 0,
+      dueDate: nextReviewDate(1),
+      source: result.origin === 'online' ? 'manual' : 'ecdict',
+      tags: result.entry.tags,
+      createdAt: now,
+      updatedAt: now,
+    }
+    setWords((items) => [created, ...items])
+    setSelectedWordId(created.id)
   }
 
   const completeRecitation = () => {
     if (!currentWord) return
-    const nextCount = totalCount(currentWord) + 1
-    const nextInterval = reviewInterval(nextCount)
-    setWords((items) => items.map((word) => word.id === currentWord.id
-      ? { ...word, interval: nextInterval, due: addDays(nextInterval), reciteCount: word.reciteCount + 1 }
-      : word))
+    const count = exposureCount(currentWord) + 1
+    setWords((items) => items.map((word) => word.id === currentWord.id ? {
+      ...word,
+      reciteCount: word.reciteCount + 1,
+      dueDate: nextReviewDate(count),
+      updatedAt: new Date().toISOString(),
+    } : word))
     setHistory((items) => {
-      const existing = items.find((item) => item.date === today())
-      return existing
-        ? items.map((item) => item.date === today() ? { ...item, reviewed: item.reviewed + 1 } : item)
-        : [...items, { date: today(), reviewed: 1 }]
+      const exists = items.some((record) => record.date === today)
+      return exists
+        ? items.map((record) => record.date === today ? { ...record, recited: record.recited + 1 } : record)
+        : [...items, { date: today, recited: 1 }]
     })
-    setQueue((items) => items.slice(1))
+    setExtraQueue((items) => items.filter((id) => id !== currentWord.id))
     setShowAnswer(false)
   }
 
-  const openLookup = (word: Word) => {
-    const nextCount = totalCount(word) + 1
-    const nextInterval = reviewInterval(nextCount)
-    setWords((items) => items.map((item) => item.id === word.id
-      ? { ...item, lookupCount: item.lookupCount + 1, interval: nextInterval, due: addDays(nextInterval) }
-      : item))
-    setLookedUpId(word.id)
+  useEffect(() => {
+    const keyboard = (event: KeyboardEvent) => {
+      if (view !== 'study' || !currentWord || event.target instanceof HTMLInputElement) return
+      if (event.code === 'Space') { event.preventDefault(); setShowAnswer((value) => !value) }
+      if (event.code === 'Enter' && showAnswer) completeRecitation()
+    }
+    window.addEventListener('keydown', keyboard)
+    return () => window.removeEventListener('keydown', keyboard)
+  })
+
+  const continueLearning = () => {
+    const candidates = [...words].sort((left, right) => exposureCount(left) - exposureCount(right)).slice(0, 30).map((word) => word.id)
+    setExtraQueue(candidates)
+    setShowAnswer(false)
   }
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (view !== 'study' || !currentWord || event.target instanceof HTMLInputElement) return
-      if (event.code === 'Space') {
-        event.preventDefault()
-        setShowAnswer((value) => !value)
-      }
-      if (showAnswer && event.code === 'Enter') completeRecitation()
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  })
+  const importWordFile = async (file: File) => {
+    const imported = await parseWordFile(file)
+    const before = words.length
+    const merged = mergeWordLists(words, imported)
+    setWords(merged)
+    setNotice(`读取 ${imported.length} 条，新增 ${merged.length - before} 条；重复单词保留原计数并自动合并。`)
+    if (fileInput.current) fileInput.current.value = ''
+  }
 
   const addWord = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const data = new FormData(event.currentTarget)
-    const wordText = String(data.get('word') || '').trim()
+    const term = String(data.get('word') || '').trim()
     const meaning = String(data.get('meaning') || '').trim()
-    if (!wordText || !meaning) return
-    const newWord: Word = {
-      id: `${wordText.toLowerCase()}-${Date.now()}`,
-      word: wordText,
-      phonetic: String(data.get('phonetic') || ''),
-      meaning,
-      example: String(data.get('example') || ''),
-      exampleMeaning: '', interval: 0, due: today(), lookupCount: 0, reciteCount: 0,
-    }
-    setWords((items) => [newWord, ...items])
-    setQueue((items) => [newWord.id, ...items])
+    if (!term || !meaning) return
+    const now = new Date().toISOString()
+    const record: WordRecord = { id: wordId(term), word: term, phonetic: String(data.get('phonetic') || ''), meaning, definition: '', example: String(data.get('example') || ''), exampleMeaning: '', lookupCount: 0, reciteCount: 0, dueDate: today, source: 'manual', tags: ['自定义'], createdAt: now, updatedAt: now }
+    setWords((items) => mergeWordLists(items, [record]))
     setAdding(false)
   }
 
-  const importWords = async (file: File) => {
-    const text = await file.text()
-    const existing = new Set(words.map((word) => word.word.toLowerCase()))
-    const imported = text.split(/\r?\n/).map((line, index) => {
-      const [word = '', meaning = '', phonetic = '', example = ''] = line.split(/[\t,]/).map((part) => part.trim())
-      if (!word || !meaning || existing.has(word.toLowerCase())) return null
-      existing.add(word.toLowerCase())
-      return { id: `${word.toLowerCase()}-${Date.now()}-${index}`, word, meaning, phonetic, example, exampleMeaning: '', interval: 0, due: today(), lookupCount: 0, reciteCount: 0 } satisfies Word
-    }).filter((word): word is Word => word !== null)
-    if (imported.length) {
-      setWords((items) => [...imported, ...items])
-      setQueue((items) => [...imported.map((word) => word.id), ...items].slice(0, 10))
-    }
-    if (fileInput.current) fileInput.current.value = ''
+  const importArchive = async () => {
+    const result = await window.moraDesktop?.importArchive()
+    if (!result) return
+    if (result.error) { setNotice(result.error); return }
+    if (!isArchive(result.data)) { setNotice('这不是有效的默记存档。'); return }
+    const archivedWords = result.data.words
+    setWords(archivedWords)
+    setHistory(result.data.history)
+    setSettings({ ...initialSettings, ...result.data.settings })
+    setNotice(`已从 ${result.file} 导入 ${archivedWords.length} 个单词及其计数，正在核对 GitHub 词典…`)
+    const localKeys = new Set(dictionary.map((entry) => normalizeWord(entry.word)))
+    const missing = archivedWords.filter((word) => !localKeys.has(normalizeWord(word.word)))
+    try {
+      const resolved = await lookupGithubBatch(missing.map((word) => word.word))
+      setWords((items) => items.map((word) => {
+        const entry = resolved.get(normalizeWord(word.word))
+        return entry ? {
+          ...word,
+          phonetic: word.phonetic || entry.phonetic,
+          meaning: word.meaning || entry.meaning,
+          definition: word.definition || entry.definition,
+          tags: [...new Set([...word.tags, ...entry.tags])],
+          updatedAt: new Date().toISOString(),
+        } : word
+      }))
+      setNotice(`存档导入完成；${resolved.size} 个本地未缓存单词已从 GitHub 补全。`)
+    } catch { setNotice('存档计数已导入；当前网络不可用，未缓存单词将在以后联网时补全。') }
   }
 
-  const startMore = () => {
-    setQueue(words.filter((word) => word.due <= today()).slice(0, 10).map((word) => word.id))
-    setShowAnswer(false)
+  const chooseArchiveFolder = async () => {
+    if (!window.moraDesktop) return
+    const info = await window.moraDesktop.chooseArchiveFolder()
+    setArchiveInfo(info)
+    const data: ArchiveData = { version: 2, updatedAt: new Date().toISOString(), words, history, settings }
+    await window.moraDesktop.saveArchive(data)
+    setNotice('已切换存档文件夹，当前数据将自动写入新位置。')
   }
 
-  return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand"><span className="brand-mark">m</span><span>默记</span></div>
-        <nav>
-          <button className={view === 'study' ? 'active' : ''} onClick={() => setView('study')}><Icon name="home" />今日学习</button>
-          <button className={view === 'lookup' ? 'active' : ''} onClick={() => setView('lookup')}><Icon name="search" />查单词</button>
-          <button className={view === 'words' ? 'active' : ''} onClick={() => setView('words')}><Icon name="book" />我的词库<span className="nav-count">{words.length}</span></button>
-          <button className={view === 'stats' ? 'active' : ''} onClick={() => setView('stats')}><Icon name="chart" />学习统计</button>
-        </nav>
-        <div className="sidebar-card">
-          <span>今日目标</span><strong>{reviewedToday}<small> / 10</small></strong>
-          <div className="mini-progress"><i style={{ width: `${progress}%` }} /></div>
-        </div>
-        <div className="sidebar-bottom">
-          <button onClick={() => setDark((value) => !value)}><Icon name="sun" />{dark ? '浅色模式' : '深色模式'}</button>
-          <div className="profile"><span>W</span><div><b>学习者</b><small>坚持积累</small></div></div>
-        </div>
-      </aside>
+  const useDefaultArchiveFolder = async () => {
+    if (!window.moraDesktop) return
+    const info = await window.moraDesktop.useDefaultArchiveFolder()
+    setArchiveInfo(info)
+    const data: ArchiveData = { version: 2, updatedAt: new Date().toISOString(), words, history, settings }
+    await window.moraDesktop.saveArchive(data)
+    setNotice('已恢复默认存档位置并写入当前数据。')
+  }
 
-      <main>
-        <header>
-          <div>
-            <p>{view === 'study' ? 'TODAY' : view === 'lookup' ? 'LOOKUP' : view === 'words' ? 'VOCABULARY' : 'PROGRESS'}</p>
-            <h1>{view === 'study' ? '今日学习' : view === 'lookup' ? '查单词' : view === 'words' ? '我的词库' : '学习统计'}</h1>
-          </div>
-          <div className="header-date">{new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).format(new Date())}</div>
-        </header>
+  const categories = ['全部', '今日复习', '未背诵', '熟悉 8+', 'CET4', 'CET6', 'IELTS', 'TOEFL', 'GRE', '自定义', '导入']
+  const libraryWords = useMemo(() => words.filter((word) => {
+    const matchesSearch = !librarySearch || normalizeWord(word.word).includes(normalizeWord(librarySearch)) || word.meaning.includes(librarySearch)
+    const matchesCategory = category === '全部'
+      || (category === '今日复习' && word.dueDate <= today)
+      || (category === '未背诵' && word.reciteCount === 0)
+      || (category === '熟悉 8+' && exposureCount(word) >= 8)
+      || (['CET4', 'CET6', 'IELTS', 'TOEFL', 'GRE'].includes(category) && word.tags.some((tag) => tag.toLowerCase() === category.toLowerCase()))
+      || (category === '自定义' && word.source === 'manual')
+      || (category === '导入' && word.source === 'import')
+    return matchesSearch && matchesCategory
+  }), [category, librarySearch, today, words])
 
-        {view === 'study' && (
-          <section className="study-view">
-            <div className="session-line">
-              <span>今日进度</span><div className="progress-track"><i style={{ width: `${progress}%` }} /></div><b>{reviewedToday} / 10</b>
-            </div>
-            {currentWord ? (
-              <div className={`flashcard ${showAnswer ? 'revealed' : ''}`}>
-                <div className="card-top"><span>{totalCount(currentWord) === 0 ? '新词' : `已看 ${totalCount(currentWord)} 次`}</span><span>剩余 {queue.length}</span></div>
-                <div className="word-area">
-                  <button className="sound-button" onClick={() => speak(currentWord.word)} aria-label="播放发音"><Icon name="volume" /></button>
-                  <h2>{currentWord.word}</h2><p>{currentWord.phonetic}</p>
-                </div>
-                {!showAnswer ? (
-                  <button className="reveal-button" onClick={() => setShowAnswer(true)}>显示答案 <kbd>Space</kbd></button>
-                ) : (
-                  <div className="answer-area">
-                    <div className="divider"><span>释义</span></div>
-                    <h3>{currentWord.meaning}</h3>
-                    {currentWord.example && <blockquote><p>{currentWord.example}</p><small>{currentWord.exampleMeaning}</small></blockquote>}
-                    <div className="encounter-summary"><span>查阅 {currentWord.lookupCount} 次</span><span>背诵 {currentWord.reciteCount} 次</span><span>总计 {totalCount(currentWord)} 次</span></div>
-                    <button className="complete-button" onClick={completeRecitation}>完成这次背诵 <small>下次：{reviewInterval(totalCount(currentWord) + 1)} 天后</small><kbd>Enter</kbd></button>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="empty-state">
-                <span className="done-mark">✓</span><h2>今天完成了</h2><p>做得不错，让记忆休息一下吧。</p>
-                {dueCount > 0 && <button className="primary-button" onClick={startMore}>再学一组</button>}
-              </div>
-            )}
-            <p className="keyboard-tip">按 <kbd>Space</kbd> 查看答案，按 <kbd>Enter</kbd> 完成一次背诵</p>
-          </section>
-        )}
+  const speak = (term: string) => {
+    speechSynthesis.cancel()
+    const speech = new SpeechSynthesisUtterance(term)
+    speech.lang = 'en-US'
+    speech.rate = 0.82
+    speechSynthesis.speak(speech)
+  }
 
-        {view === 'lookup' && (
-          <section className="lookup-view">
-            <div className="lookup-search"><Icon name="search" /><input value={lookupQuery} onChange={(event) => { setLookupQuery(event.target.value); setLookedUpId(null) }} autoFocus placeholder="输入要查阅的单词或中文释义…" /></div>
-            {!lookedUpWord && lookupQuery && <div className="lookup-results">
-              {lookupResults.map((word) => <button key={word.id} onClick={() => openLookup(word)}><span><b>{word.word}</b><small>{word.phonetic}</small></span><span>{word.meaning}</span><em>已看 {totalCount(word)} 次</em></button>)}
-              {lookupResults.length === 0 && <div className="lookup-empty">词库中没有找到这个单词，请先在“我的词库”中添加。</div>}
-            </div>}
-            {lookedUpWord && <div className="lookup-card">
-              <div className="lookup-word"><div><h2>{lookedUpWord.word}</h2><p>{lookedUpWord.phonetic}</p></div><button className="sound-button static" onClick={() => speak(lookedUpWord.word)} aria-label="播放发音"><Icon name="volume" /></button></div>
-              <h3>{lookedUpWord.meaning}</h3>
-              {lookedUpWord.example && <blockquote><p>{lookedUpWord.example}</p><small>{lookedUpWord.exampleMeaning}</small></blockquote>}
-              <div className="lookup-counts"><div><strong>{lookedUpWord.lookupCount}</strong><span>查阅次数</span></div><div><strong>{lookedUpWord.reciteCount}</strong><span>背诵次数</span></div><div><strong>{totalCount(lookedUpWord)}</strong><span>总次数</span></div></div>
-              <p className="lookup-notice">本次查阅已自动计数，下次复习安排在 {lookedUpWord.due}。</p>
-            </div>}
-            {!lookupQuery && <div className="lookup-welcome"><Icon name="search" /><h2>从你的词库中查找</h2><p>每次打开一个单词都会记录一次查阅，并参与复习安排。</p></div>}
-          </section>
-        )}
+  if (!ready) return <div className="boot-screen"><span className="brand-mark">m</span><p>正在读取存档…</p></div>
 
-        {view === 'words' && (
-          <section className="words-view">
-            <div className="toolbar"><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索单词或释义…" /><input ref={fileInput} className="file-input" type="file" accept=".txt,.csv,.tsv" onChange={(event) => event.target.files?.[0] && importWords(event.target.files[0])} /><button className="secondary-button" onClick={() => fileInput.current?.click()}><Icon name="upload" />导入</button><button className="primary-button" onClick={() => setAdding(true)}><Icon name="plus" />添加单词</button></div>
-            <div className="word-table">
-              <div className="table-row table-head"><span>单词</span><span>释义</span><span>查阅 / 背诵</span><span>总次数</span><span>下次复习</span></div>
-              {filteredWords.map((word) => <div className="table-row" key={word.id}><span><b>{word.word}</b><small>{word.phonetic}</small></span><span>{word.meaning}</span><span>{word.lookupCount} / {word.reciteCount}</span><span className="count-badge">{totalCount(word)}</span><span>{word.due <= today() ? '今天' : word.due}</span></div>)}
-            </div>
-          </section>
-        )}
+  return <div className="app-shell">
+    <aside className="sidebar">
+      <div className="brand"><span className="brand-mark">m</span><span>默记</span></div>
+      <nav>
+        <button className={view === 'study' ? 'active' : ''} onClick={() => setView('study')}><Icon name="study"/>背单词</button>
+        <button className={view === 'lookup' ? 'active' : ''} onClick={() => setView('lookup')}><Icon name="search"/>查单词</button>
+        <button className={view === 'library' ? 'active' : ''} onClick={() => setView('library')}><Icon name="book"/>单词目录<span>{words.length}</span></button>
+        <button className={view === 'stats' ? 'active' : ''} onClick={() => setView('stats')}><Icon name="chart"/>统计与设置</button>
+      </nav>
+      <div className="goal-card"><small>今日目标</small><strong>{reviewedToday}<em> / {settings.dailyGoal}</em></strong><div><i style={{ width: `${Math.min(100, reviewedToday / settings.dailyGoal * 100)}%` }}/></div>{goalComplete && <b>目标已完成，可继续学习</b>}</div>
+      <button className="theme-button" onClick={() => setDark((value) => !value)}><Icon name="moon"/>{dark ? '浅色模式' : '深色模式'}</button>
+    </aside>
 
-        {view === 'stats' && (
-          <section className="stats-view">
-            <div className="stat-grid">
-              <div><span>词库总量</span><strong>{words.length}</strong><small>个单词</small></div><div><span>已经看过</span><strong>{learnedCount}</strong><small>个单词</small></div><div><span>高频熟悉</span><strong>{masteredCount}</strong><small>总计 ≥ 8 次</small></div><div><span>累计接触</span><strong>{words.reduce((sum, word) => sum + totalCount(word), 0)}</strong><small>查阅和背诵</small></div>
-            </div>
-            <div className="activity-card"><div><h2>最近学习</h2><p>每一次主动回忆都在加深记忆。</p></div><div className="activity-bars">
-              {Array.from({ length: 14 }).map((_, index) => { const date = new Date(new Date(`${today()}T12:00:00`).getTime() - (13 - index) * DAY).toISOString().slice(0, 10); const count = history.find((item) => item.date === date)?.reviewed || 0; return <i key={date} title={`${date}: ${count} 次`} style={{ height: `${Math.max(8, Math.min(100, count * 9))}%` }} /> })}
-            </div></div>
-          </section>
-        )}
-      </main>
+    <main>
+      <header><div><p>{view.toUpperCase()}</p><h1>{view === 'study' ? '今日背诵' : view === 'lookup' ? '查单词' : view === 'library' ? '单词目录' : '统计与设置'}</h1></div><span>{new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).format(new Date())}</span></header>
 
-      {adding && <div className="modal-backdrop" onMouseDown={() => setAdding(false)}><form className="modal" onSubmit={addWord} onMouseDown={(event) => event.stopPropagation()}>
-        <div><p>NEW WORD</p><h2>添加单词</h2></div><label>单词<input name="word" autoFocus required placeholder="例如：deliberate" /></label><label>音标<input name="phonetic" placeholder="/dɪˈlɪbərət/" /></label><label>释义<input name="meaning" required placeholder="adj. 深思熟虑的" /></label><label>例句<input name="example" placeholder="输入一个简短例句" /></label><div className="modal-actions"><button type="button" onClick={() => setAdding(false)}>取消</button><button className="primary-button" type="submit">保存单词</button></div>
-      </form></div>}
-    </div>
-  )
+      {view === 'study' && <section className="study-view">
+        <div className="study-meta"><span>{goalComplete ? '今日目标已完成' : `距离目标还差 ${Math.max(0, settings.dailyGoal - reviewedToday)} 个`}</span><b>到期 {dueWords.length}</b></div>
+        {currentWord ? <article className={`study-card ${showAnswer ? 'answer-visible' : ''}`}>
+          <div className="card-label"><span>{extraQueue.length ? '继续学习' : currentWord.reciteCount ? '到期复习' : '新词'}</span><b>已看 {exposureCount(currentWord)} 次</b></div>
+          <div className="term-header"><div><h2 style={currentWord.word.length > 20 ? { fontSize: '38px' } : undefined}>{currentWord.word}</h2><p>{currentWord.phonetic}</p></div><button onClick={() => speak(currentWord.word)} aria-label="播放发音"><Icon name="sound"/></button></div>
+          {!showAnswer ? <button className="reveal" onClick={() => setShowAnswer(true)}>显示释义 <kbd>Space</kbd></button> : <div className="answer-panel">
+            <h3>{currentWord.meaning}</h3>{currentWord.definition && <p className="definition">{currentWord.definition}</p>}{currentWord.example && <blockquote>{currentWord.example}<small>{currentWord.exampleMeaning}</small></blockquote>}
+            <div className="counts"><span>查阅 <b>{currentWord.lookupCount}</b></span><span>背诵 <b>{currentWord.reciteCount}</b></span><span>总计 <b>{exposureCount(currentWord)}</b></span></div>
+            <button className="primary complete" onClick={completeRecitation}>完成一次背诵 <small>下次 {intervalForExposure(exposureCount(currentWord) + 1)} 天后</small><kbd>Enter</kbd></button>
+          </div>}
+        </article> : <div className="empty-card"><span>✓</span><h2>当前复习已完成</h2><p>你仍然可以继续学习低接触次数的单词。</p><button className="primary" onClick={continueLearning}>继续背单词</button></div>}
+      </section>}
+
+      {view === 'lookup' && <section className="lookup-view">
+        <form className="search-box" onSubmit={(event) => { event.preventDefault(); searchRemote() }}><Icon name="search"/><input value={query} onChange={(event) => { setQuery(event.target.value); setRemoteResults([]); setSelectedWordId(null) }} placeholder="输入英文单词或中文释义" autoFocus/><button type="submit">{remoteSearching ? '查询中…' : '联网查询'}</button></form>
+        <div className={`dictionary-status ${dictionaryStatus}`}><i/><span>{dictionaryStatus === 'loading' ? `正在加载本地词典 ${dictionaryProgress.toLocaleString()} 词` : dictionaryStatus === 'error' ? '本地词典不可用，将直接联网查询' : `本地已缓存 ${dictionary.length.toLocaleString()} 词 · ${dictionaryStatus === 'cached' ? '离线缓存' : 'GitHub 已同步'}`}</span></div>
+        {selectedWord ? <article className="lookup-card"><button className="back-button" onClick={() => setSelectedWordId(null)}><Icon name="back"/>返回结果</button><div className="term-header"><div><h2 style={selectedWord.word.length > 20 ? { fontSize: '34px' } : undefined}>{selectedWord.word}</h2><p>{selectedWord.phonetic}</p></div><button onClick={() => speak(selectedWord.word)} aria-label="播放发音"><Icon name="sound"/></button></div><h3>{selectedWord.meaning}</h3>{selectedWord.definition && <p className="definition">{selectedWord.definition}</p>}<div className="counts large"><span><b>{selectedWord.lookupCount}</b>查阅次数</span><span><b>{selectedWord.reciteCount}</b>背诵次数</span><span><b>{exposureCount(selectedWord)}</b>总次数</span></div><p className="saved-note">本次查阅已计数，预计 {selectedWord.dueDate} 复习</p></article>
+        : query ? <div className="result-list">{visibleResults.map((result) => <button key={`${result.origin}-${result.entry.word}`} onClick={() => openLookupResult(result)}><span><b>{result.entry.word}</b><small>{result.entry.phonetic}</small></span><span>{result.entry.meaning.split('\n')[0]}</span><em>{result.origin === 'personal' ? `已看 ${result.count}` : result.origin === 'cache' ? '本地' : result.origin === 'github' ? 'GitHub' : '在线'}</em></button>)}{!visibleResults.length && !remoteSearching && <div className="no-result"><p>本地缓存中没有结果</p><button onClick={searchRemote}>从 GitHub 和在线词典查找</button></div>}</div>
+        : <div className="lookup-intro"><Icon name="search"/><h2>三级词典查询</h2><p>先查本地缓存，未找到则查询 GitHub 大词典，最后使用公共在线词典。</p></div>}
+      </section>}
+
+      {view === 'library' && <section className="library-view">
+        <div className="toolbar"><input value={librarySearch} onChange={(event) => setLibrarySearch(event.target.value)} placeholder="搜索目录…"/><input ref={fileInput} hidden type="file" accept=".csv,.tsv,.txt" onChange={(event) => event.target.files?.[0] && importWordFile(event.target.files[0])}/><button onClick={() => fileInput.current?.click()}><Icon name="upload"/>导入词表</button><button className="primary" onClick={() => setAdding(true)}><Icon name="plus"/>添加单词</button></div>
+        <div className="categories">{categories.map((item) => <button className={category === item ? 'active' : ''} onClick={() => setCategory(item)} key={item}>{item}</button>)}</div>
+        <div className="word-table"><div className="word-row head"><span>单词</span><span>释义</span><span>查阅 / 背诵</span><span>总计</span><span>下次复习</span></div>{libraryWords.map((word) => <div className="word-row" key={word.id}><span><b>{word.word}</b><small>{word.phonetic}</small></span><span>{word.meaning.split('\n')[0]}</span><span>{word.lookupCount} / {word.reciteCount}</span><span><i>{exposureCount(word)}</i></span><span>{word.dueDate <= today ? '今天' : word.dueDate}</span></div>)}</div>
+      </section>}
+
+      {view === 'stats' && <section className="stats-view">
+        <div className="stats-grid"><div><small>个人单词</small><strong>{words.length}</strong><span>个</span></div><div><small>今日背诵</small><strong>{reviewedToday}</strong><span>次</span></div><div><small>累计接触</small><strong>{words.reduce((sum, word) => sum + exposureCount(word), 0)}</strong><span>次</span></div><div><small>熟悉单词</small><strong>{words.filter((word) => exposureCount(word) >= 8).length}</strong><span>总计 ≥ 8</span></div></div>
+        <div className="settings-card"><h2>每日目标</h2><p>达到目标后仍可继续背诵。</p><div className="goal-options">{[10, 20, 30, 50, 100].map((goal) => <button className={settings.dailyGoal === goal ? 'active' : ''} onClick={() => setSettings((value) => ({ ...value, dailyGoal: goal }))} key={goal}>{goal}</button>)}</div></div>
+        <div className="settings-card"><h2>存档位置</h2><p className="path">{archiveInfo?.file || '浏览器预览模式：使用 IndexedDB'}</p>{archiveInfo?.fallback && <p className="warning">程序目录不可写，已安全回退到用户数据目录。</p>}<div className="setting-actions"><button onClick={chooseArchiveFolder} disabled={!window.moraDesktop}><Icon name="folder"/>选择自定义文件夹</button><button onClick={importArchive} disabled={!window.moraDesktop}><Icon name="upload"/>导入存档</button>{archiveInfo?.custom && <button onClick={useDefaultArchiveFolder}>恢复默认位置</button>}</div></div>
+        <div className="settings-card"><h2>本地词典缓存</h2><p>当前 {dictionary.length.toLocaleString()} 词。每次启动时都可重新选择。</p><button onClick={() => setStartupOpen(true)}>重新选择缓存量</button></div>
+      </section>}
+    </main>
+
+    {startupOpen && <div className="startup-backdrop"><div className="startup-dialog"><div className="brand"><span className="brand-mark">m</span><span>默记</span></div><p className="eyebrow">LOCAL DICTIONARY</p><h2>这次要在本地保存多少词？</h2><p>常用词按实际语料频率分层。从 GitHub 同步后，即使断网也可以查询已缓存部分。</p><div className="cache-options">{CACHE_OPTIONS.map((option) => <button key={option.size} onClick={() => begin(option.size)} disabled={dictionaryStatus === 'loading'}><b>{option.label}</b><span>{option.hint}</span><small>{option.download}</small>{settings.cacheSize === option.size && <em>上次选择</em>}</button>)}</div>{dictionaryStatus === 'loading' && <div className="startup-progress"><i/><span>正在同步，已读取 {dictionaryProgress.toLocaleString()} 词…</span></div>}{startupError && <div className="startup-error">{startupError}<button onClick={() => setStartupOpen(false)}>暂不加载，进入应用</button></div>}</div></div>}
+
+    {adding && <div className="modal-backdrop" onMouseDown={() => setAdding(false)}><form className="modal" onSubmit={addWord} onMouseDown={(event) => event.stopPropagation()}><h2>添加单词</h2><label>单词<input name="word" required autoFocus/></label><label>音标<input name="phonetic"/></label><label>中文释义<input name="meaning" required/></label><label>例句<input name="example"/></label><div><button type="button" onClick={() => setAdding(false)}>取消</button><button className="primary" type="submit">保存</button></div></form></div>}
+    {notice && <div className="toast" onClick={() => setNotice('')}>{notice}<button>×</button></div>}
+  </div>
 }
 
 export default App
