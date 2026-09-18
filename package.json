@@ -1,7 +1,7 @@
 {
   "name": "word-memorizer",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "一个专注、纯粹的背单词桌面应用",
   "author": "dfsjiv",
   "license": "MIT",

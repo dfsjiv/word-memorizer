@@ -28,16 +28,19 @@ export const loadDictionaryTiers = async (size: CacheSize, onProgress?: (loaded:
   let cachedCount = 0
   for (const tier of TIER_FILES[size]) {
     const key = `ecdict-tier-${tier}-v1`
-    let payload: TierPayload | undefined
-    try {
-      const response = await fetch(`${RAW_BASE}/tier-${tier}.json`, { cache: 'no-cache' })
-      if (!response.ok) throw new Error(String(response.status))
-      payload = await response.json() as TierPayload
-      await saveAsset(key, payload)
-      onlineCount += payload.entries.length
-    } catch {
-      payload = await loadAsset<TierPayload>(key)
-      if (payload) cachedCount += payload.entries.length
+    let payload = await loadAsset<TierPayload>(key)
+    if (payload) {
+      cachedCount += payload.entries.length
+    } else {
+      try {
+        const response = await fetch(`${RAW_BASE}/tier-${tier}.json`)
+        if (!response.ok) throw new Error(String(response.status))
+        payload = await response.json() as TierPayload
+        await saveAsset(key, payload).catch(() => undefined)
+        onlineCount += payload.entries.length
+      } catch {
+        // A missing tier can be skipped when lower cached tiers still exist.
+      }
     }
     if (payload) entries.push(...payload.entries)
     onProgress?.(entries.length)
@@ -58,10 +61,18 @@ const loadShard = async (letter: string) => {
   if (!letter || !/[a-z]/.test(letter)) return []
   let entries = memoryShards.get(letter)
   if (!entries) {
+    const key = `ecdict-shard-${letter}-v1`
+    const cached = await loadAsset<ShardPayload>(key)
+    if (cached) {
+      entries = cached.entries
+      memoryShards.set(letter, entries)
+      return entries
+    }
     const response = await fetch(`${RAW_BASE}/shards/${letter}.json.gz`, { cache: 'force-cache' })
     if (!response.ok) throw new Error(`GitHub dictionary request failed: ${response.status}`)
     const payload = await gunzipJson(response)
     entries = payload.entries
+    await saveAsset(key, payload).catch(() => undefined)
     memoryShards.set(letter, entries)
   }
   return entries
