@@ -13,7 +13,7 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "desktop": "npm run build && electron .",
-    "package:win": "npm run build && electron-packager . 默记 --platform=win32 --arch=x64 --out=release-packager --overwrite --prune=true --ignore=\"^/(src|output|release.*|\\.git)\" && electron-builder --win nsis --prepackaged release-packager/默记-win32-x64 --config.directories.output=release-installer"
+    "package:win": "npm run build && electron-packager . 默记 --platform=win32 --arch=x64 --out=release-packager --overwrite --prune=true --ignore=\"^/(src|dictionary|work|output|release.*|\\.git|\\.playwright-cli)\" && electron-builder --win nsis --prepackaged release-packager/默记-win32-x64 --config.directories.output=release-installer"
   },
   "dependencies": {
     "papaparse": "^5.7.0",
