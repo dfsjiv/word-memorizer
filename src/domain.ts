@@ -34,7 +34,7 @@ export type DictionaryPayload = {
   entries: DictionaryEntry[]
 }
 
-export type DailyRecord = { date: string; recited: number }
+export type DailyRecord = { date: string; recited: number; wordIds?: string[]; uniqueWords?: number }
 
 export const normalizeWord = (word: string) => word.trim().normalize('NFKC').toLocaleLowerCase('en-US')
 export const wordId = (word: string) => `word:${encodeURIComponent(normalizeWord(word))}`

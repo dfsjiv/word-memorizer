@@ -11,11 +11,11 @@ import { loadWords, saveWords } from './storage'
 
 type View = 'study' | 'lookup' | 'library' | 'stats'
 type DictionaryStatus = 'idle' | 'loading' | 'online' | 'cached' | 'mixed' | 'error'
-type Settings = { dailyGoal: number; cacheSize: CacheSize }
+type Settings = { dailyGoal: number; cacheSize: CacheSize; newWordRepetitions: number; continueBatchSize: number }
 type ArchiveData = { version: 2; updatedAt: string; words: WordRecord[]; history: DailyRecord[]; settings: Settings }
 type SearchResult = { entry: DictionaryEntry; origin: 'personal' | 'cache' | 'github' | 'online'; count: number }
 
-const initialSettings: Settings = { dailyGoal: 20, cacheSize: 10000 }
+const initialSettings: Settings = { dailyGoal: 20, cacheSize: 10000, newWordRepetitions: 2, continueBatchSize: 20 }
 
 const isArchive = (value: unknown): value is ArchiveData => {
   if (!value || typeof value !== 'object') return false
@@ -31,6 +31,35 @@ const asEntry = (word: WordRecord): DictionaryEntry => ({
   tags: word.tags,
   rank: null,
 })
+
+const asStudyWord = (entry: DictionaryEntry, today: string): WordRecord => {
+  const now = new Date().toISOString()
+  return {
+    id: wordId(entry.word),
+    word: entry.word,
+    phonetic: entry.phonetic,
+    meaning: entry.meaning,
+    definition: entry.definition,
+    example: '',
+    exampleMeaning: '',
+    lookupCount: 0,
+    reciteCount: 0,
+    dueDate: today,
+    source: 'ecdict',
+    tags: entry.tags,
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+const spacedQueue = (ids: string[], appearances: number) => {
+  const queue: string[] = []
+  for (let start = 0; start < ids.length; start += 5) {
+    const group = ids.slice(start, start + 5)
+    for (let pass = 0; pass < appearances; pass += 1) queue.push(...group)
+  }
+  return queue
+}
 
 const Icon = ({ name }: { name: 'study' | 'search' | 'book' | 'chart' | 'sound' | 'upload' | 'plus' | 'folder' | 'moon' | 'back' }) => {
   const paths = {
@@ -64,7 +93,8 @@ function App() {
   const [remoteSearching, setRemoteSearching] = useState(false)
   const [selectedWordId, setSelectedWordId] = useState<string | null>(null)
   const [showAnswer, setShowAnswer] = useState(false)
-  const [extraQueue, setExtraQueue] = useState<string[]>([])
+  const [sessionQueue, setSessionQueue] = useState<string[]>([])
+  const [batchKind, setBatchKind] = useState<'daily' | 'continue'>('daily')
   const [librarySearch, setLibrarySearch] = useState('')
   const [category, setCategory] = useState('全部')
   const [adding, setAdding] = useState(false)
@@ -120,13 +150,34 @@ function App() {
   }, [history, ready, settings, words])
 
   const today = localDate()
-  const reviewedToday = history.find((record) => record.date === today)?.recited || 0
+  const todayRecord = history.find((record) => record.date === today)
+  const reviewedToday = todayRecord?.uniqueWords ?? todayRecord?.wordIds?.length ?? todayRecord?.recited ?? 0
   const goalComplete = reviewedToday >= settings.dailyGoal
   const dueWords = useMemo(() => words
     .filter((word) => word.dueDate <= today)
     .sort((left, right) => left.dueDate.localeCompare(right.dueDate) || exposureCount(left) - exposureCount(right)), [today, words])
-  const currentWord = words.find((word) => word.id === extraQueue[0]) || dueWords[0]
+  const currentWord = words.find((word) => word.id === sessionQueue[0])
   const selectedWord = words.find((word) => word.id === selectedWordId)
+
+  const queueNewWords = (entries: DictionaryEntry[], amount: number, kind: 'daily' | 'continue', includeDue: boolean) => {
+    const known = new Set(words.map((word) => normalizeWord(word.word)))
+    const candidates = entries.filter((entry) => !known.has(normalizeWord(entry.word))).slice(0, amount)
+    const created = candidates.map((entry) => asStudyWord(entry, today))
+    const dueIds = includeDue ? dueWords.map((word) => word.id) : []
+    const newIds = created.map((word) => word.id)
+    setWords((items) => mergeWordLists(items, created))
+    setSessionQueue([...dueIds, ...spacedQueue(newIds, settings.newWordRepetitions)])
+    setBatchKind(kind)
+    setShowAnswer(false)
+    return { added: created.length, due: dueIds.length }
+  }
+
+  const prepareDailyQueue = (entries: DictionaryEntry[]) => {
+    const remaining = Math.max(0, settings.dailyGoal - reviewedToday)
+    const newAmount = Math.max(0, remaining - dueWords.length)
+    const result = queueNewWords(entries, newAmount, 'daily', true)
+    if (!result.due && !result.added && remaining > 0) setNotice('本地词典中已没有未学的新词，可以在设置中选择更大的词典缓存。')
+  }
 
   const begin = async (size: CacheSize) => {
     setStartupError('')
@@ -137,6 +188,7 @@ function App() {
       setDictionary(loaded.entries)
       setDictionaryStatus(loaded.source)
       setSettings((current) => ({ ...current, cacheSize: size }))
+      prepareDailyQueue(loaded.entries)
       setStartupOpen(false)
     } catch (error) {
       setDictionaryStatus('error')
@@ -239,10 +291,21 @@ function App() {
     setHistory((items) => {
       const exists = items.some((record) => record.date === today)
       return exists
-        ? items.map((record) => record.date === today ? { ...record, recited: record.recited + 1 } : record)
-        : [...items, { date: today, recited: 1 }]
+        ? items.map((record) => {
+          if (record.date !== today) return record
+          const wordIds = record.wordIds || []
+          const alreadyCounted = wordIds.includes(currentWord.id)
+          const uniqueWords = record.uniqueWords ?? (record.wordIds ? record.wordIds.length : record.recited)
+          return {
+            ...record,
+            recited: record.recited + 1,
+            wordIds: alreadyCounted ? wordIds : [...wordIds, currentWord.id],
+            uniqueWords: uniqueWords + (alreadyCounted ? 0 : 1),
+          }
+        })
+        : [...items, { date: today, recited: 1, wordIds: [currentWord.id], uniqueWords: 1 }]
     })
-    setExtraQueue((items) => items.filter((id) => id !== currentWord.id))
+    setSessionQueue((items) => items.slice(1))
     setShowAnswer(false)
   }
 
@@ -257,9 +320,8 @@ function App() {
   })
 
   const continueLearning = () => {
-    const candidates = [...words].sort((left, right) => exposureCount(left) - exposureCount(right)).slice(0, 30).map((word) => word.id)
-    setExtraQueue(candidates)
-    setShowAnswer(false)
+    const result = queueNewWords(dictionary, settings.continueBatchSize, 'continue', false)
+    if (!result.added) setNotice('当前本地词典中的单词都已进入个人目录，请选择更大的本地词典后继续。')
   }
 
   const importWordFile = async (file: File) => {
@@ -372,14 +434,14 @@ function App() {
       {view === 'study' && <section className="study-view">
         <div className="study-meta"><span>{goalComplete ? '今日目标已完成' : `距离目标还差 ${Math.max(0, settings.dailyGoal - reviewedToday)} 个`}</span><b>到期 {dueWords.length}</b></div>
         {currentWord ? <article className={`study-card ${showAnswer ? 'answer-visible' : ''}`}>
-          <div className="card-label"><span>{extraQueue.length ? '继续学习' : currentWord.reciteCount ? '到期复习' : '新词'}</span><b>已看 {exposureCount(currentWord)} 次</b></div>
+          <div className="card-label"><span>{currentWord.reciteCount > 0 && currentWord.createdAt.slice(0, 10) === today ? '间隔巩固' : batchKind === 'continue' ? '继续学习 · 新词' : currentWord.reciteCount ? '到期复习' : '今日新词'}</span><b>队列 {sessionQueue.length} · 已看 {exposureCount(currentWord)} 次</b></div>
           <div className="term-header"><div><h2 style={currentWord.word.length > 20 ? { fontSize: '38px' } : undefined}>{currentWord.word}</h2><p>{currentWord.phonetic}</p></div><button onClick={() => speak(currentWord.word)} aria-label="播放发音"><Icon name="sound"/></button></div>
           {!showAnswer ? <button className="reveal" onClick={() => setShowAnswer(true)}>显示释义 <kbd>Space</kbd></button> : <div className="answer-panel">
             <h3>{currentWord.meaning}</h3>{currentWord.definition && <p className="definition">{currentWord.definition}</p>}{currentWord.example && <blockquote>{currentWord.example}<small>{currentWord.exampleMeaning}</small></blockquote>}
             <div className="counts"><span>查阅 <b>{currentWord.lookupCount}</b></span><span>背诵 <b>{currentWord.reciteCount}</b></span><span>总计 <b>{exposureCount(currentWord)}</b></span></div>
             <button className="primary complete" onClick={completeRecitation}>完成一次背诵 <small>下次 {intervalForExposure(exposureCount(currentWord) + 1)} 天后</small><kbd>Enter</kbd></button>
           </div>}
-        </article> : <div className="empty-card"><span>✓</span><h2>当前复习已完成</h2><p>你仍然可以继续学习低接触次数的单词。</p><button className="primary" onClick={continueLearning}>继续背单词</button></div>}
+        </article> : <div className="empty-card"><span>✓</span><h2>{goalComplete ? '今日目标已完成' : '当前批次已完成'}</h2><p>继续学习会从本地词典加入 {settings.continueBatchSize} 个没学过的新词，不会循环上一批。</p><button className="primary" onClick={continueLearning}>继续背 {settings.continueBatchSize} 个新词</button></div>}
       </section>}
 
       {view === 'lookup' && <section className="lookup-view">
@@ -397,14 +459,14 @@ function App() {
       </section>}
 
       {view === 'stats' && <section className="stats-view">
-        <div className="stats-grid"><div><small>个人单词</small><strong>{words.length}</strong><span>个</span></div><div><small>今日背诵</small><strong>{reviewedToday}</strong><span>次</span></div><div><small>累计接触</small><strong>{words.reduce((sum, word) => sum + exposureCount(word), 0)}</strong><span>次</span></div><div><small>熟悉单词</small><strong>{words.filter((word) => exposureCount(word) >= 8).length}</strong><span>总计 ≥ 8</span></div></div>
-        <div className="settings-card"><h2>每日目标</h2><p>达到目标后仍可继续背诵。</p><div className="goal-options">{[10, 20, 30, 50, 100].map((goal) => <button className={settings.dailyGoal === goal ? 'active' : ''} onClick={() => setSettings((value) => ({ ...value, dailyGoal: goal }))} key={goal}>{goal}</button>)}</div></div>
+        <div className="stats-grid"><div><small>个人单词</small><strong>{words.length}</strong><span>个</span></div><div><small>今日不同单词</small><strong>{reviewedToday}</strong><span>个</span></div><div><small>累计接触</small><strong>{words.reduce((sum, word) => sum + exposureCount(word), 0)}</strong><span>次</span></div><div><small>熟悉单词</small><strong>{words.filter((word) => exposureCount(word) >= 8).length}</strong><span>总计 ≥ 8</span></div></div>
+        <div className="settings-card"><h2>学习数量与重复</h2><p>可直接输入任意目标；新词会每 5 个为一组进行间隔巩固。</p><div className="number-settings"><label><span>每日不同单词目标</span><input type="number" min="1" max="1000" value={settings.dailyGoal} onChange={(event) => setSettings((value) => ({ ...value, dailyGoal: Math.max(1, Math.min(1000, Number(event.target.value) || 1)) }))}/><small>个</small></label><label><span>完成后继续加入</span><input type="number" min="1" max="500" value={settings.continueBatchSize} onChange={(event) => setSettings((value) => ({ ...value, continueBatchSize: Math.max(1, Math.min(500, Number(event.target.value) || 1)) }))}/><small>个新词</small></label><label><span>每个新词本轮出现</span><input type="number" min="1" max="5" value={settings.newWordRepetitions} onChange={(event) => setSettings((value) => ({ ...value, newWordRepetitions: Math.max(1, Math.min(5, Number(event.target.value) || 1)) }))}/><small>次</small></label></div><p className="setting-note">设置会自动保存，并在下一批学习时生效。</p></div>
         <div className="settings-card"><h2>存档位置</h2><p className="path">{archiveInfo?.file || '浏览器预览模式：使用 IndexedDB'}</p>{archiveInfo?.fallback && <p className="warning">程序目录不可写，已安全回退到用户数据目录。</p>}<div className="setting-actions"><button onClick={chooseArchiveFolder} disabled={!window.moraDesktop}><Icon name="folder"/>选择自定义文件夹</button><button onClick={importArchive} disabled={!window.moraDesktop}><Icon name="upload"/>导入存档</button>{archiveInfo?.custom && <button onClick={useDefaultArchiveFolder}>恢复默认位置</button>}</div></div>
         <div className="settings-card"><h2>本地词典缓存</h2><p>当前 {dictionary.length.toLocaleString()} 词。每次启动时都可重新选择。</p><button onClick={() => setStartupOpen(true)}>重新选择缓存量</button></div>
       </section>}
     </main>
 
-    {startupOpen && <div className="startup-backdrop"><div className="startup-dialog"><div className="brand"><span className="brand-mark">m</span><span>默记</span></div><p className="eyebrow">LOCAL DICTIONARY</p><h2>这次要在本地保存多少词？</h2><p>常用词按实际语料频率分层。从 GitHub 同步后，即使断网也可以查询已缓存部分。</p><div className="cache-options">{CACHE_OPTIONS.map((option) => <button key={option.size} onClick={() => begin(option.size)} disabled={dictionaryStatus === 'loading'}><b>{option.label}</b><span>{option.hint}</span><small>{option.download}</small>{settings.cacheSize === option.size && <em>上次选择</em>}</button>)}</div>{dictionaryStatus === 'loading' && <div className="startup-progress"><i/><span>正在同步，已读取 {dictionaryProgress.toLocaleString()} 词…</span></div>}{startupError && <div className="startup-error">{startupError}<button onClick={() => setStartupOpen(false)}>暂不加载，进入应用</button></div>}</div></div>}
+    {startupOpen && <div className="startup-backdrop"><div className="startup-dialog"><div className="brand"><span className="brand-mark">m</span><span>默记</span></div><p className="eyebrow">LOCAL DICTIONARY</p><h2>这次要在本地保存多少词？</h2><p>常用词按实际语料频率分层。同步后会自动从中补足每日新词，断网也可以继续学习和查询。</p><div className="cache-options">{CACHE_OPTIONS.map((option) => <button key={option.size} onClick={() => begin(option.size)} disabled={dictionaryStatus === 'loading'}><b>{option.label}</b><span>{option.hint}</span><small>{option.download}</small>{settings.cacheSize === option.size && <em>上次选择</em>}</button>)}</div>{dictionaryStatus === 'loading' && <div className="startup-progress"><i/><span>正在同步，已读取 {dictionaryProgress.toLocaleString()} 词…</span></div>}{startupError && <div className="startup-error">{startupError}<button onClick={() => { setSessionQueue(dueWords.map((word) => word.id)); setStartupOpen(false) }}>暂不加载，只复习已有单词</button></div>}</div></div>}
 
     {adding && <div className="modal-backdrop" onMouseDown={() => setAdding(false)}><form className="modal" onSubmit={addWord} onMouseDown={(event) => event.stopPropagation()}><h2>添加单词</h2><label>单词<input name="word" required autoFocus/></label><label>音标<input name="phonetic"/></label><label>中文释义<input name="meaning" required/></label><label>例句<input name="example"/></label><div><button type="button" onClick={() => setAdding(false)}>取消</button><button className="primary" type="submit">保存</button></div></form></div>}
     {notice && <div className="toast" onClick={() => setNotice('')}>{notice}<button>×</button></div>}
